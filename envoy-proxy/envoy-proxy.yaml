@@ -1,0 +1,184 @@
+# =============================================================================
+# Конфигурация Envoy Proxy как mTLS-прокси перед NGINX
+#
+# Схема: Клиент --mTLS--> Envoy:8443 --mTLS--> NGINX:443
+#
+# Envoy терминирует mTLS (проверяет клиентский сертификат),
+# затем проксирует запрос на NGINX backend по mTLS,
+# передавая информацию о клиентском сертификате в заголовках.
+#
+# Сертификаты читаются из /tmp/envoy-certs/ (entrypoint копирует из /etc/envoy/certs/)
+# =============================================================================
+
+static_resources:
+  # ---------------------------------------------------------------------------
+  # Cluster: NGINX-backend (mTLS внутри Docker-сети)
+  # Envoy выступает как mTLS-клиент по отношению к NGINX
+  # ---------------------------------------------------------------------------
+  clusters:
+  - name: nginx_backend
+    type: STRICT_DNS
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: nginx_backend
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: nginx-mtls-server
+                port_value: 443
+    # Upstream mTLS: Envoy предъявляет клиентский сертификат NGINX-у
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        common_tls_context:
+          tls_params:
+            tls_minimum_protocol_version: TLSv1_2
+            tls_maximum_protocol_version: TLSv1_3
+          tls_certificates:
+          - certificate_chain:
+              filename: /tmp/envoy-certs/client.crt
+            private_key:
+              filename: /tmp/envoy-certs/client.key
+          validation_context:
+            trusted_ca:
+              filename: /tmp/envoy-certs/ca.crt
+        sni: nginx-mtls-server
+
+  # ---------------------------------------------------------------------------
+  # Listener: mTLS-терминация на порту 8443
+  # ---------------------------------------------------------------------------
+  listeners:
+  - name: mtls_listener
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 8443
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: mtls_proxy
+          codec_type: AUTO
+
+          # -----------------------------------------------------------------
+          # Access Log — вывод в stdout (доступен через docker logs)
+          # -----------------------------------------------------------------
+          access_log:
+          - name: envoy.access_loggers.stdout
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+              log_format:
+                text_format: "[%START_TIME%] \"%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%\" %RESPONSE_CODE% peer_subject=%DOWNSTREAM_PEER_SUBJECT% peer_serial=%DOWNSTREAM_PEER_SERIAL% tls_version=%DOWNSTREAM_TLS_VERSION% tls_cipher=%DOWNSTREAM_TLS_CIPHER% upstream=%UPSTREAM_CLUSTER%\n"
+
+          # -----------------------------------------------------------------
+          # Маршрутизация — проксирование на NGINX-backend
+          # -----------------------------------------------------------------
+          route_config:
+            name: proxy_route
+            virtual_hosts:
+            - name: backend
+              domains: ["*"]
+              routes:
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: nginx_backend
+
+          # -----------------------------------------------------------------
+          # HTTP-фильтры: Lua (добавление заголовков) → Router
+          # -----------------------------------------------------------------
+          http_filters:
+          - name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              inline_code: |
+                function envoy_on_request(request_handle)
+                  local headers = request_handle:headers()
+
+                  -- Получаем SSL информацию через Envoy Lua API
+                  local subject = ""
+                  local serial = ""
+                  local fingerprint = ""
+                  local valid_from = ""
+                  local expiration = ""
+                  local tls_version = ""
+                  local cipher = ""
+
+                  local ok, ssl = pcall(function()
+                    return request_handle:connection():ssl()
+                  end)
+
+                  if ok and ssl then
+                    -- TLS Version
+                    local s1, v1 = pcall(function() return ssl:tlsVersion() end)
+                    if s1 and v1 then tls_version = tostring(v1) end
+
+                    -- Cipher Suite
+                    local s2, v2 = pcall(function() return ssl:ciphersuiteString() end)
+                    if s2 and v2 then cipher = tostring(v2) end
+
+                    -- Subject Peer Certificate
+                    local s3, v3 = pcall(function() return ssl:subjectPeerCertificate() end)
+                    if s3 and v3 then subject = tostring(v3) end
+                  end
+
+                  -- Для serial, fingerprint, дат — используем StreamInfo properties
+                  local stream = request_handle:streamInfo()
+                  if stream then
+                    local ps, vs = pcall(function() return stream:getProperty("downstream.peer_serial") end)
+                    if ps and vs then serial = tostring(vs) end
+
+                    local pf, vf = pcall(function() return stream:getProperty("downstream.peer_fingerprint") end)
+                    if pf and vf then fingerprint = tostring(vf) end
+
+                    local pvf, vvf = pcall(function() return stream:getProperty("downstream.peer_cert_not_before") end)
+                    if pvf and vvf then valid_from = tostring(vvf) end
+
+                    local pve, vve = pcall(function() return stream:getProperty("downstream.peer_cert_not_after") end)
+                    if pve and vve then expiration = tostring(vve) end
+                  end
+
+                  -- Добавляем cert-info в заголовки запроса (передаются на NGINX-backend)
+                  headers:add("X-Client-DN", subject)
+                  headers:add("X-Client-Serial", serial)
+                  headers:add("X-Client-Fingerprint", fingerprint)
+                  headers:add("X-Client-Cert-NotBefore", valid_from)
+                  headers:add("X-Client-Cert-NotAfter", expiration)
+                  headers:add("X-TLS-Version", tls_version)
+                  headers:add("X-TLS-Cipher", cipher)
+                end
+
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+      # -----------------------------------------------------------------
+      # Настройки mTLS: серверный сертификат + проверка клиента
+      # -----------------------------------------------------------------
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_params:
+              tls_minimum_protocol_version: TLSv1_2
+              tls_maximum_protocol_version: TLSv1_3
+            tls_certificates:
+            - certificate_chain:
+                filename: /tmp/envoy-certs/server.crt
+              private_key:
+                filename: /tmp/envoy-certs/server.key
+            validation_context:
+              trusted_ca:
+                filename: /tmp/envoy-certs/ca.crt
+          require_client_certificate: true
+
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901

@@ -1,0 +1,150 @@
+# =============================================================================
+# Конфигурация Envoy Proxy для mTLS
+# Аналог NGINX mTLS, но на базе Envoy
+#
+# Сертификаты читаются из /tmp/envoy-certs/ (entrypoint копирует из /etc/envoy/certs/)
+# =============================================================================
+
+static_resources:
+  listeners:
+  - name: mtls_listener
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 8443
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: mtls
+          codec_type: AUTO
+
+          # -----------------------------------------------------------------
+          # Access Log — вывод в stdout (доступен через docker logs)
+          # -----------------------------------------------------------------
+          access_log:
+          - name: envoy.access_loggers.stdout
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+              log_format:
+                text_format: "[%START_TIME%] \"%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%\" %RESPONSE_CODE% peer_subject=%DOWNSTREAM_PEER_SUBJECT% peer_serial=%DOWNSTREAM_PEER_SERIAL% tls_version=%DOWNSTREAM_TLS_VERSION% tls_cipher=%DOWNSTREAM_TLS_CIPHER%\n"
+
+          # -----------------------------------------------------------------
+          # Маршрутизация — direct_response как заглушка
+          # -----------------------------------------------------------------
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: backend
+              domains: ["*"]
+              routes:
+              - match:
+                  prefix: "/"
+                direct_response:
+                  status: 200
+                  body:
+                    inline_string: "fallback"
+
+          # -----------------------------------------------------------------
+          # HTTP-фильтры: Lua (динамический ответ) → Router
+          # -----------------------------------------------------------------
+          http_filters:
+          - name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              inline_code: |
+                function envoy_on_request(request_handle)
+                  local path = request_handle:headers():get(":path") or "/"
+
+                  local subject = ""
+                  local serial = ""
+                  local fingerprint = ""
+                  local valid_from = ""
+                  local expiration = ""
+                  local tls_version = ""
+                  local cipher = ""
+
+                  -- Получаем SSL информацию через Envoy Lua API
+                  local ok, ssl = pcall(function()
+                    return request_handle:connection():ssl()
+                  end)
+
+                  if ok and ssl then
+                    -- TLS Version
+                    local s1, v1 = pcall(function() return ssl:tlsVersion() end)
+                    if s1 and v1 then tls_version = tostring(v1) end
+
+                    -- Cipher Suite (ciphersuiteString, не tlsCipherSuite)
+                    local s2, v2 = pcall(function() return ssl:ciphersuiteString() end)
+                    if s2 and v2 then cipher = tostring(v2) end
+
+                    -- Subject Peer Certificate (subjectPeerCertificate, не peerSubject)
+                    local s3, v3 = pcall(function() return ssl:subjectPeerCertificate() end)
+                    if s3 and v3 then subject = tostring(v3) end
+                  end
+
+                  -- Для serial, fingerprint, дат — используем StreamInfo properties
+                  local stream = request_handle:streamInfo()
+                  if stream then
+                    local ps, vs = pcall(function() return stream:getProperty("downstream.peer_serial") end)
+                    if ps and vs then serial = tostring(vs) end
+
+                    local pf, vf = pcall(function() return stream:getProperty("downstream.peer_fingerprint") end)
+                    if pf and vf then fingerprint = tostring(vf) end
+
+                    local pvf, vvf = pcall(function() return stream:getProperty("downstream.peer_cert_not_before") end)
+                    if pvf and vvf then valid_from = tostring(vvf) end
+
+                    local pve, vve = pcall(function() return stream:getProperty("downstream.peer_cert_not_after") end)
+                    if pve and vve then expiration = tostring(vve) end
+                  end
+
+                  if path == "/health" then
+                    request_handle:respond(
+                      {[":status"] = "200", ["content-type"] = "application/json"},
+                      '{"status":"ok","proxy":"envoy","tls":"mutual","client":"' .. subject .. '"}'
+                    )
+                  elseif path == "/cert-info" then
+                    request_handle:respond(
+                      {[":status"] = "200", ["content-type"] = "application/json"},
+                      '{"client_dn":"' .. subject .. '","client_fingerprint":"' .. fingerprint .. '","client_serial":"' .. serial .. '","client_v_start":"' .. valid_from .. '","client_v_end":"' .. expiration .. '","ssl_protocol":"' .. tls_version .. '","ssl_cipher":"' .. cipher .. '"}'
+                    )
+                  else
+                    request_handle:respond(
+                      {[":status"] = "200", ["content-type"] = "text/plain"},
+                      "mTLS Success! Welcome, " .. subject .. "\n"
+                    )
+                  end
+                end
+
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+      # -----------------------------------------------------------------
+      # Настройки mTLS: серверный сертификат + проверка клиента
+      # -----------------------------------------------------------------
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_params:
+              tls_minimum_protocol_version: TLSv1_2
+              tls_maximum_protocol_version: TLSv1_3
+            tls_certificates:
+            - certificate_chain:
+                filename: /tmp/envoy-certs/server.crt
+              private_key:
+                filename: /tmp/envoy-certs/server.key
+            validation_context:
+              trusted_ca:
+                filename: /tmp/envoy-certs/ca.crt
+          require_client_certificate: true
+
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
